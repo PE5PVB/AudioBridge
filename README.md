@@ -16,7 +16,7 @@ A lightweight Windows audio router that streams audio from one sound card's inpu
 
 ## Screenshot
 
-![AudioBridge](screenshot.png)!\
+![AudioBridge](screenshot.png)
 
 ## Use Cases
 
