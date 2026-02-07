@@ -1,0 +1,9 @@
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP_ICON ICON "app.ico"
+
+IDR_FONT_REGULAR  RCDATA "TitilliumWeb-Regular.ttf"
+IDR_FONT_LIGHT    RCDATA "TitilliumWeb-Light.ttf"
+IDR_FONT_SEMIBOLD RCDATA "TitilliumWeb-SemiBold.ttf"
+IDR_BG_IMAGE      RCDATA "bg.jpg"
