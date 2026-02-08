@@ -33,7 +33,7 @@ static constexpr COLORREF CLR_BTN_HOVER = RGB(0x5c, 0xd4, 0xa8);
 
 // ── Window metrics ─────────────────────────────────────────────────
 static constexpr int WIN_W  = 500;
-static constexpr int WIN_H  = 490;
+static constexpr int WIN_H  = 516;
 static constexpr int MARGIN = 20;
 static constexpr int COMBO_H = 28;
 static constexpr int BTN_W  = 100;
@@ -75,7 +75,18 @@ static bool g_exclusiveMode = false; // radio state: false=shared, true=exclusiv
 static RECT g_radioSharedRc = {};
 static RECT g_radioExclusiveRc = {};
 
+static bool g_minimizeToTray = false;
+static bool g_startWithWindows = false;
+static RECT g_chkTrayRc = {};
+static RECT g_chkStartupRc = {};
+
+static NOTIFYICONDATAW g_nid = {};
+static bool g_trayIconAdded = false;
+static UINT WM_TASKBARCREATED = 0;
+static RECT g_statusPanelRc = {};
+
 #define WM_APP_AUTOSTART (WM_APP + 1)
+#define WM_APP_TRAYICON  (WM_APP + 2)
 
 // ── Forward declarations ───────────────────────────────────────────
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -153,6 +164,8 @@ struct AppSettings {
     std::wstring renderDeviceId;
     bool exclusiveMode = false;
     bool autoStart = false;
+    bool minimizeToTray = false;
+    bool startWithWindows = false;
 };
 
 static std::wstring getSettingsPath() {
@@ -176,6 +189,8 @@ static AppSettings loadSettings() {
 
     s.exclusiveMode = GetPrivateProfileIntW(L"Audio", L"ExclusiveMode", 0, path.c_str()) != 0;
     s.autoStart = GetPrivateProfileIntW(L"Audio", L"AutoStart", 0, path.c_str()) != 0;
+    s.minimizeToTray = GetPrivateProfileIntW(L"Audio", L"MinimizeToTray", 0, path.c_str()) != 0;
+    s.startWithWindows = GetPrivateProfileIntW(L"Audio", L"StartWithWindows", 0, path.c_str()) != 0;
 
     return s;
 }
@@ -185,11 +200,125 @@ static void saveSettings(const std::wstring& captureId, const std::wstring& rend
     WritePrivateProfileStringW(L"Audio", L"CaptureDevice", captureId.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Audio", L"RenderDevice", renderId.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Audio", L"ExclusiveMode", exclusive ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"Audio", L"MinimizeToTray", g_minimizeToTray ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"Audio", L"StartWithWindows", g_startWithWindows ? L"1" : L"0", path.c_str());
 }
 
 static void saveAutoStart(bool running) {
     std::wstring path = getSettingsPath();
     WritePrivateProfileStringW(L"Audio", L"AutoStart", running ? L"1" : L"0", path.c_str());
+}
+
+// ── Start with Windows (Task Scheduler with logon trigger) ───────
+static void runSchtasks(const wchar_t* args) {
+    wchar_t cmdLine[1024] = {};
+    swprintf_s(cmdLine, L"schtasks.exe %s", args);
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+static bool isStartWithWindowsEnabled() {
+    // Check Task Scheduler first (primary method)
+    wchar_t cmdLine[] = L"schtasks.exe /query /tn \"AudioBridge\"";
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        if (exitCode == 0) return true;
+    }
+    // Fallback: check registry Run key
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    bool exists = RegQueryValueExW(hKey, L"AudioBridge", nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+    RegCloseKey(hKey);
+    return exists;
+}
+
+static void setStartWithWindows(bool enable) {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    if (enable) {
+        // Try Task Scheduler first (fastest startup, runs in parallel)
+        wchar_t args[MAX_PATH * 2] = {};
+        swprintf_s(args,
+            L"/create /tn \"AudioBridge\" /tr \"\\\"%s\\\" --startup\" /sc onlogon /rl limited /f",
+            exePath);
+        runSchtasks(args);
+
+        // Also set registry Run key as fallback (works without admin)
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                          L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                          0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            wchar_t value[MAX_PATH + 20] = {};
+            swprintf_s(value, L"\"%s\" --startup", exePath);
+            RegSetValueExW(hKey, L"AudioBridge", 0, REG_SZ,
+                           (const BYTE*)value, (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hKey);
+        }
+    } else {
+        // Remove both
+        runSchtasks(L"/delete /tn \"AudioBridge\" /f");
+
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                          L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                          0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, L"AudioBridge");
+            RegCloseKey(hKey);
+        }
+    }
+}
+
+// ── Check if app should start hidden in tray ─────────────────────
+bool ShouldStartMinimized() {
+    return g_minimizeToTray && wcsstr(GetCommandLineW(), L"--startup") != nullptr;
+}
+
+// ── System tray helpers ──────────────────────────────────────────
+static void addTrayIcon(HWND hWnd) {
+    if (g_trayIconAdded) return;
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hWnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAYICON;
+    g_nid.hIcon = g_appIcon;
+    wcscpy_s(g_nid.szTip, L"AudioBridge");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_trayIconAdded = true;
+}
+
+static void removeTrayIcon() {
+    if (!g_trayIconAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    g_trayIconAdded = false;
+}
+
+static void showFromTray(HWND hWnd) {
+    ShowWindow(hWnd, SW_SHOW);
+    ShowWindow(hWnd, SW_RESTORE);
+    SetForegroundWindow(hWnd);
 }
 
 // ── Load bg.jpg from embedded resource via GDI+ ──────────────────
@@ -312,6 +441,11 @@ static void createControls(HWND hWnd) {
     g_radioSharedRc = {x, y, x + 130, y + RADIO_H};
     g_radioExclusiveRc = {x + 140, y, x + 280, y + RADIO_H};
     g_exclusiveMode = false;
+    y += RADIO_H + GAP + GAP;
+
+    // Option checkboxes (custom drawn)
+    g_chkTrayRc = {x, y, x + 170, y + RADIO_H};
+    g_chkStartupRc = {x + 180, y, x + 370, y + RADIO_H};
     y += RADIO_H + GAP + GAP;
 
     // Buttons
@@ -561,11 +695,11 @@ static void onPaint(HWND hWnd) {
 
     // Labels (drawn between controls)
     RECT lblCapture = {x, y, x + innerW, y + LABEL_H + 4};
-    drawText(memDC, L"Input Device (Capture):", lblCapture, CLR_TEXT_DIM, g_fontSmall);
+    drawText(memDC, L"Input Device:", lblCapture, CLR_TEXT_DIM, g_fontSmall);
     y += LABEL_H + GAP + COMBO_H + GAP + GAP;
 
     RECT lblRender = {x, y, x + innerW, y + LABEL_H + 4};
-    drawText(memDC, L"Output Device (Render):", lblRender, CLR_TEXT_DIM, g_fontSmall);
+    drawText(memDC, L"Output Device:", lblRender, CLR_TEXT_DIM, g_fontSmall);
     y += LABEL_H + GAP + COMBO_H + GAP + GAP;
 
     RECT lblMode = {x, y, x + innerW, y + LABEL_H + 4};
@@ -611,6 +745,44 @@ static void onPaint(HWND hWnd) {
 
     drawRadio(g_radioSharedRc, L"Shared Mode", !g_exclusiveMode);
     drawRadio(g_radioExclusiveRc, L"Exclusive Mode", g_exclusiveMode);
+    y += RADIO_H + GAP + GAP;
+
+    // Custom checkboxes
+    auto drawCheckbox = [&](RECT rc, const wchar_t* label, bool checked) {
+        int boxSize = 14;
+        int cx = rc.left;
+        int cy = rc.top + (RADIO_H - boxSize) / 2;
+
+        // Outer box
+        HPEN outerPen = CreatePen(PS_SOLID, 1, checked ? CLR_ACCENT : CLR_TEXT_DIM);
+        HBRUSH fillBr = CreateSolidBrush(checked ? CLR_ACCENT : CLR_PANEL);
+        HPEN oldP = (HPEN)SelectObject(memDC, outerPen);
+        HBRUSH oldB = (HBRUSH)SelectObject(memDC, fillBr);
+        Rectangle(memDC, cx, cy, cx + boxSize, cy + boxSize);
+        SelectObject(memDC, oldP);
+        SelectObject(memDC, oldB);
+        DeleteObject(outerPen);
+        DeleteObject(fillBr);
+
+        // Checkmark when checked
+        if (checked) {
+            HPEN chkPen = CreatePen(PS_SOLID, 2, CLR_BG);
+            oldP = (HPEN)SelectObject(memDC, chkPen);
+            MoveToEx(memDC, cx + 3, cy + 7, nullptr);
+            LineTo(memDC, cx + 6, cy + 10);
+            LineTo(memDC, cx + 11, cy + 3);
+            SelectObject(memDC, oldP);
+            DeleteObject(chkPen);
+        }
+
+        // Label text
+        RECT textRc = {cx + boxSize + 6, rc.top, rc.right, rc.bottom};
+        drawText(memDC, label, textRc, checked ? CLR_TEXT : CLR_TEXT_DIM, g_fontNormal,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    };
+
+    drawCheckbox(g_chkTrayRc, L"Minimize to tray", g_minimizeToTray);
+    drawCheckbox(g_chkStartupRc, L"Start with Windows", g_startWithWindows);
     y += RADIO_H + GAP + GAP + BTN_H + GAP + GAP;
 
     // ── Status panel ──────────────────────────────────────────────
@@ -618,6 +790,7 @@ static void onPaint(HWND hWnd) {
     int statusPanelH = 4 * STATUS_H + 3 * GAP + 16;
     RECT statusPanel = {MARGIN + PANEL_PAD - 4, statusY,
                         WIN_W - MARGIN - PANEL_PAD + 4, statusY + statusPanelH};
+    g_statusPanelRc = statusPanel;
     fillRoundRect(memDC, statusPanel, 8, CLR_ACCENT_DK);
 
     int sx = MARGIN + PANEL_PAD + 8;
@@ -678,7 +851,7 @@ static void onPaint(HWND hWnd) {
     // Footer - version and GitHub link
     int footerY = statusPanel.bottom + 14;
     RECT versionRc = {MARGIN + PANEL_PAD, footerY, WIN_W - MARGIN - PANEL_PAD, footerY + STATUS_H + 4};
-    drawText(memDC, L"v1.00 - Sjef Verhoeven PE5PVB", versionRc, CLR_TEXT_DIM, g_fontSmall,
+    drawText(memDC, L"v1.10 - Sjef Verhoeven PE5PVB", versionRc, CLR_TEXT_DIM, g_fontSmall,
              DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     g_linkRc = {MARGIN + PANEL_PAD, footerY + STATUS_H + 2,
@@ -699,6 +872,7 @@ static void onPaint(HWND hWnd) {
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
+            WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
             enableDarkTitleBar(hWnd);
             createControls(hWnd);
             return 0;
@@ -771,6 +945,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (PtInRect(&g_radioExclusiveRc, pt) && !g_exclusiveMode) {
                 g_exclusiveMode = true;
                 InvalidateRect(hWnd, nullptr, FALSE);
+            } else if (PtInRect(&g_chkTrayRc, pt)) {
+                g_minimizeToTray = !g_minimizeToTray;
+                if (g_minimizeToTray)
+                    addTrayIcon(hWnd);
+                else
+                    removeTrayIcon();
+                InvalidateRect(hWnd, nullptr, FALSE);
+            } else if (PtInRect(&g_chkStartupRc, pt)) {
+                g_startWithWindows = !g_startWithWindows;
+                setStartWithWindows(g_startWithWindows);
+                InvalidateRect(hWnd, nullptr, FALSE);
             }
             break;
         }
@@ -788,7 +973,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_TIMER:
             if (wParam == IDT_STATUS_TIMER) {
-                InvalidateRect(hWnd, nullptr, FALSE);
+                InvalidateRect(hWnd, &g_statusPanelRc, FALSE);
                 if (g_router) {
                     RouterStatus rs = g_router->getStatus();
                     if (rs.state == RouterState::Error)
@@ -802,6 +987,37 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             onApply(hWnd);
             return 0;
 
+        case WM_APP_TRAYICON:
+            if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+                showFromTray(hWnd);
+            } else if (LOWORD(lParam) == WM_RBUTTONUP) {
+                POINT pt;
+                GetCursorPos(&pt);
+                HMENU hMenu = CreatePopupMenu();
+                AppendMenuW(hMenu, MF_STRING, 1, L"Open");
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, 2, L"Exit");
+                SetForegroundWindow(hWnd);
+                int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
+                                         pt.x, pt.y, 0, hWnd, nullptr);
+                DestroyMenu(hMenu);
+                if (cmd == 1) {
+                    showFromTray(hWnd);
+                } else if (cmd == 2) {
+                    showFromTray(hWnd);
+                    SendMessageW(hWnd, WM_CLOSE, 0, 0);
+                }
+            }
+            return 0;
+
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED && g_minimizeToTray) {
+                addTrayIcon(hWnd);
+                ShowWindow(hWnd, SW_HIDE);
+                return 0;
+            }
+            break;
+
         case WM_CLOSE: {
             bool wasRunning = g_router && g_router->getStatus().state == RouterState::Running;
             onStop(hWnd);              // This sets AutoStart=0
@@ -811,6 +1027,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_DESTROY:
+            removeTrayIcon();
             if (g_fontNormal) { DeleteObject(g_fontNormal); g_fontNormal = nullptr; }
             if (g_fontBold)   { DeleteObject(g_fontBold);   g_fontBold = nullptr; }
             if (g_fontSmall)  { DeleteObject(g_fontSmall);  g_fontSmall = nullptr; }
@@ -824,6 +1041,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }
             PostQuitMessage(0);
             return 0;
+    }
+    // Handle TaskbarCreated (Explorer restart) - re-add tray icon
+    if (WM_TASKBARCREATED && msg == WM_TASKBARCREATED && g_trayIconAdded) {
+        g_trayIconAdded = false;
+        addTrayIcon(hWnd);
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -853,6 +1075,11 @@ static void populateDevices(HWND hWnd) {
     // Restore saved settings
     AppSettings settings = loadSettings();
     g_exclusiveMode = settings.exclusiveMode;
+    g_minimizeToTray = settings.minimizeToTray;
+    g_startWithWindows = isStartWithWindowsEnabled(); // Registry is source of truth
+
+    if (g_minimizeToTray)
+        addTrayIcon(hWnd);
 
     for (int i = 0; i < (int)g_captureDevices.size(); ++i) {
         if (g_captureDevices[i].id == settings.captureDeviceId) {

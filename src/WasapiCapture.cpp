@@ -121,7 +121,10 @@ HRESULT WasapiCapture::tryExclusiveFormat(WORD channels, DWORD sampleRate,
     REFERENCE_TIME defaultPeriod, minPeriod;
     RETURN_IF_FAILED(m_audioClient->GetDevicePeriod(&defaultPeriod, &minPeriod));
 
-    REFERENCE_TIME requestedDuration = minPeriod;
+    // Use half of defaultPeriod for a good latency/reliability balance.
+    // minPeriod alone is too aggressive and causes underruns on most hardware.
+    REFERENCE_TIME requestedDuration = (defaultPeriod / 2 > minPeriod)
+                                        ? defaultPeriod / 2 : minPeriod;
 
     hr = m_audioClient->Initialize(
         AUDCLNT_SHAREMODE_EXCLUSIVE,
